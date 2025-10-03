@@ -21,6 +21,7 @@ const Tokens* = {
 
     # Symbols
     " ":         "SPACE",
+    ".":         "PERIOD",
     ";":         "SEMI_COLON",
     ":":         "COLON",
     "#":         "SINGLE_COMMENT",

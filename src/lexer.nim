@@ -16,9 +16,10 @@ type TOKEN = tuple[
 var LexerTokens = initTable[int, seq[TOKEN]]()
 var DISCARDED: TOKEN = (Token: "DISCARDED", Value: "", isToken: false, isStatement: false)
 
+
 # Token Checker #
 proc isValidToken(token: string): TOKEN =
-  if len(token) == 1 and token != ".":
+  if len(token) == 1:
     if Tokens.hasKey(token):
       return (Token: Tokens.getOrDefault(token), Value: token, isToken: true, isStatement: false)
     
@@ -64,11 +65,11 @@ proc Tokenize(lines: seq[string]) =
 
 
 proc Adjust() =
+  # Instance Variables
   var multiline_comment = false
 
   for line in 0..<LexerTokens.len:
     var fix: seq[TOKEN] = @[]
-
     var pos = 0
     while pos < LexerTokens[line].len:
       var token = LexerTokens[line][pos]
@@ -91,12 +92,23 @@ proc Adjust() =
           skipper.inc()
 
         if pos+skipper >= LexerTokens[line].len:
-          throwError("UNFINISHED_STRING", line, @[buffer.join("")])
+          throwError("SYNTAX_ERROR", line, @[buffer.join(""), "unfinished string near: " & buffer.join(""), "`" & token.Value & "`" , "string", " `" & token.Value & "`"])
         else:
           fix.add((Token: "STR", Value: buffer.join(""), isToken: true, isStatement: false))
           LexerTokens[line][pos+skipper] = DISCARDED
           pos += skipper+1
           continue
+
+      # Numbers
+      if token.Token == "TBD":
+        try:
+          discard parseInt(token.Value)
+          fix.add((Token: "NUM", Value: token.Value, isToken: true, isStatement: false))
+          LexerTokens[line][pos] = DISCARDED
+          pos.inc()
+          continue
+        except ValueError as err:
+          discard
 
       # Comments
       if token.Token.contains("COMMENT_START"):
@@ -106,6 +118,10 @@ proc Adjust() =
       elif multiline_comment or token.Token.contains("COMMENT"):
         pos.inc()
         continue
+
+      if pos > 0:
+        if LexerTokens[line][pos-1].Token.contains("COMMENT") or multiline_comment:
+          LexerTokens[line][pos].Token = "COMMENT"
 
       # Keep useful tokens
       if token.Token != "SPACE" and token.Token != "DISCARDED" and not token.Token.contains("COMMENT"):
@@ -117,6 +133,9 @@ proc Adjust() =
 
 
 proc Lex*(filename: string): Table[int, seq[TOKEN]]=
+  # Instance Variables
+  var ReturnTokens = initTable[int, seq[TOKEN]]()
+
   # Checking if file exist
   if fileExists(filename):
     let lines = readFile(filename).splitLines()
@@ -135,21 +154,104 @@ proc Lex*(filename: string): Table[int, seq[TOKEN]]=
       case token.Token
       # Global keyword
       of "GLOBAL":
-        discard expect(@["TBD"], LexerTokens, line, pos).Value
-        LexerTokens[line][pos+1].Token = "GLOBAL_VAR"
+        let old_token = expect(@["TBD"], LexerTokens, line, pos).Value
+        LexerTokens[line][pos+1].Token = "@G_" & old_token
+        LexerTokens[line][pos] = DISCARDED
       
       # Defining Variables
       of "VAR_DEFINE":
-        discard expect(@["TBD", "STR"], LexerTokens, line, pos, "VALUE_EXPECTED")
-        let old_tk_value = LexerTokens[line][pos-1].Token
-        LexerTokens[line][pos-1].Token = "$" & old_tk_value
+        if pos - 1 < 0 or pos == 0:
+          throwError("NAME_EXPECTED", line, @[token.Value])
 
-      of "UNFOLD", "VAR_CALL", "SUB_VAR_CALL", "CALLS":
-        discard expect(@["TBD","STR","NUM"], LexerTokens, line, pos, "VALUE_EXPECTED")
+        let old_token = LexerTokens[line][pos-1].Token
+        if old_token != "TBD" and not old_token.contains("VAR") and not old_token.contains("@G_"):
+          echo old_token, ": ", LexerTokens[line][pos-1].Value
+          throwError("NAME_EXPECTED", line, @[token.Value])
+
+        discard expect(@["VAR_CALL", "STR", "O_BRACE", "NUM", "PERIOD"], LexerTokens, line, pos, "VALUE_EXPECTED")
+        LexerTokens[line][pos-1].Token = "$" & old_token.findAll(re"\@G_").join("") & "VAR"
+
+      # Reassigning Variables
+      of "EQU":
+        if pos - 1 < 0 or pos == 0:
+          throwError("NAME_EXPECTED", line, @[token.Value])
+
+        let old_token = LexerTokens[line][pos-1]
+        if old_token.Token != "VAR_CALL":
+          throwError("NAME_EXPECTED", line, @[token.Value])
+        
+        discard expect(@["VAR_CALL", "STR", "O_BRACE", "NUM", "PERIOD"], LexerTokens, line, pos, "VALUE_EXPECTED")
+
+      # Period (function calls, floats)
+      of "PERIOD":
+        if pos - 1 < 0 or pos == 0:
+          discard expect(@["TBD"], LexerTokens, line, pos)
+          LexerTokens[line][pos].Token = DISCARDED
+          LexerTokens[line][pos+1].Token = "PROC_CALL"
+        else:
+          let prev_token = expect(@["VAR_DEFINE", "NUM", "COMMA", "O_BRACE", "CONCAT", "EQU"], LexerTokens, line, pos-2, "VALUE_EXPECTED")
+          let next_token = expect(@["TBD", "NUM"], LexerTokens, line, pos, "VALUE_EXPECTED")
+
+          # Floats (eg. 3.14)
+          if prev_token.Token == "NUM" and next_token.Token != "NUM":
+            throwError("SYNTAX_ERROR", line, @[token.Value, "invalid integer: " & next_token.Value, "<integer> `" & token.Value & "`", "integer", ""])
+          else:
+            LexerTokens[line][pos-1].Value = prev_token.Value & token.Value & next_token.Value
+            LexerTokens[line][pos] = DISCARDED
+            LexerTokens[line][pos+1] = DISCARDED
+
+          # Function calls (eg. .main)
+          if prev_token.Token != "NUM" and next_token.Token == "TBD":
+            LexerTokens[line][pos].Token = DISCARDED
+            LexerTokens[line][pos+1].Token = "PROC_CALL"
+
+      # Calls (->)
+      of "CALLS":
+        if pos - 1 < 0 or pos == 0:
+          throwError("NAME_EXPECTED", line, @[token.Value])
+        else:
+          let prev_token = LexerTokens[line][pos-1]
+          let next_token = LexerTokens[line][pos+1]
+          # Lefthand Side:
+          if prev_token.Token != "TBD" and not prev_token.Token.contains("@G_"):
+            echo prev_token.Token, ": ", prev_token.Value
+            throwError("NAME_EXPECTED", line, @[token.Value, prev_token.Value])
+          else:
+            LexerTokens[line][pos-1].Token = "$" & prev_token.Token.findAll(re"\@G_").join("") & "VAR"
+
+          if next_token.Token != "UNFOLD":
+            throwError("SYNTAX_ERROR", line, @[token.Value, "& expected after '" & token.Value & "': got " & next_token.Value, "`" & token.Value & "` &", "folded_function_name", ""])
+
+      # Unfold (&)
+      of "UNFOLD":
+        let next_token = expect(@["TBD", "PROC"], LexerTokens, line, pos)
+        if LexerTokens[line][pos+1].Token.contains("STMT"):
+          LexerTokens[line][pos+1].Token = "%UNFOLD_" & next_token.Token.findAll(re"\STMT.+").join("")
+        else:
+          LexerTokens[line][pos+1].Token = "%UNFOLD_STMT"
+
+      # Variable Calling
+      of "VAR_CALL":
+        discard expect(@["TBD"], LexerTokens, line, pos)
+        LexerTokens[line][pos+1].Token = token.Token
+        LexerTokens[line][pos] = DISCARDED
+
+      # TODO:
+      of "SUB_VAR_CALL":
+        discard expect(@["TBD","STR","NUM", "PROC"], LexerTokens, line, pos, "VALUE_EXPECTED")
         throwWarning("TODO\n|> Implement check(s) for '" & token.Token & "'")
-      
+        #quit()
 
       pos.inc()
 
-  return LexerTokens
+  # Cleaning Lexer Table
+  for line in 0..<LexerTokens.len:
+    var pos = 0
+    ReturnTokens[line] = @[]
+    for token in LexerTokens[line]:
+      if token.Token != "DISCARDED":
+        ReturnTokens[line].add(LexerTokens[line][pos])
+      pos.inc()
+
+  return ReturnTokens
 
